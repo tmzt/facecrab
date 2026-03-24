@@ -383,7 +383,9 @@ async fn http_get(url: &str) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let config = rustls::ClientConfig::builder()
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|e| anyhow::anyhow!("rustls config: {e}"))?
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
