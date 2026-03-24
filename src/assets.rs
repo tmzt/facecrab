@@ -15,6 +15,7 @@ pub struct AssetAuthority {
 }
 
 impl AssetAuthority {
+    #[cfg(feature = "registry")]
     pub fn new() -> Result<Self> {
         Ok(Self {
             registry: ModelRegistry::new()?,
@@ -347,9 +348,10 @@ async fn http_get_follow(url: &str, max_redirects: u8) -> Result<(u16, Vec<(Stri
                 current_url = if location.starts_with("http") {
                     location.clone()
                 } else {
-                    // Relative redirect — join with base
-                    let base = url::Url::parse(&current_url)?;
-                    base.join(location)?.to_string()
+                    // Relative redirect — join with base origin
+                    let (scheme, rest) = current_url.split_once("://").unwrap_or(("https", &current_url));
+                    let host_part = rest.split('/').next().unwrap_or(rest);
+                    format!("{scheme}://{host_part}{location}")
                 };
                 continue;
             }
@@ -363,22 +365,20 @@ async fn http_get_follow(url: &str, max_redirects: u8) -> Result<(u16, Vec<(Stri
 
 /// Single HTTPS GET request using smol::net + rustls.
 async fn http_get(url: &str) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-    use smol::io::{AsyncReadExt, AsyncWriteExt};
-
-    let parsed = url::Url::parse(url)?;
-    let host = parsed.host_str().ok_or_else(|| anyhow::anyhow!("no host"))?;
-    let port = parsed.port().unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
-    let path = if parsed.query().is_some() {
-        format!("{}?{}", parsed.path(), parsed.query().unwrap())
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow::anyhow!("invalid URL: {url}"))?;
+    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = format!("/{path}");
+    let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
+        (h, p.parse::<u16>().unwrap_or(443))
     } else {
-        parsed.path().to_string()
+        (host_port, if scheme == "https" { 443 } else { 80 })
     };
 
     let addr = format!("{host}:{port}");
     let tcp = smol::net::TcpStream::connect(&addr).await
         .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
 
-    if parsed.scheme() == "https" {
+    if scheme == "https" {
         // TLS via futures-rustls (re-exports rustls)
         use futures_rustls::rustls;
 

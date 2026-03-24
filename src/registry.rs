@@ -58,6 +58,7 @@ impl ModelRegistry {
         Ok(registry)
     }
 
+    #[cfg(feature = "registry")]
     pub fn new() -> Result<Self> {
         let config_dir = if let Ok(home) = std::env::var("GENIUS_HOME") {
             PathBuf::from(home)
