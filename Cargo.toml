@@ -19,7 +19,7 @@ dirs = "5.0"
 futures = "0.3"
 smol = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-futures-rustls = "0.26"
+futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 webpki-roots = "1.0"
 url = "2"
 log = "0.4"
