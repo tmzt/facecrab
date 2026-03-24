@@ -1,0 +1,75 @@
+[[models]]
+name = "llama-2-7b-chat"
+repo = "TheBloke/Llama-2-7B-Chat-GGUF"
+filename = "llama-2-7b-chat.Q4_K_M.gguf"
+quantization = "Q4_K_M"
+
+[[models]]
+name = "mistral-7b-instruct"
+repo = "TheBloke/Mistral-7B-Instruct-v0.1-GGUF"
+filename = "mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+quantization = "Q4_K_M"
+purpose = "Inference"
+
+[[models]]
+name = "qwen-2.5-1.5b-instruct"
+repo = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+filename = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+quantization = "Q4_K_M"
+purpose = "Inference"
+
+[[models]]
+name = "qwen-2.5-3b-instruct"
+repo = "Qwen/Qwen2.5-3B-Instruct-GGUF"
+filename = "qwen2.5-3b-instruct-q4_k_m.gguf"
+quantization = "Q4_K_M"
+purpose = "Inference"
+
+[[models]]
+name = "tiny-model"
+repo = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+filename = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+quantization = "Q4_K_M"
+purpose = "Inference"
+
+[[models]]
+name = "nomic-embed-text"
+repo = "nomic-ai/nomic-embed-text-v1.5-GGUF"
+filename = "nomic-embed-text-v1.5.Q4_K_M.gguf"
+quantization = "Q4_K_M"
+purpose = "Embedding"
+
+[[models]]
+name = "embedding-gemma"
+repo = "unsloth/embeddinggemma-300m-GGUF"
+filename = "embeddinggemma-300m-Q4_0.gguf"
+quantization = "Q4_0"
+purpose = "Embedding"
+
+[[models]]
+name = "tiny-llama"
+repo = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
+filename = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+quantization = "Q4_K_M"
+purpose = "Inference"
+
+[[models]]
+name = "qwen-3.5-9b-instruct"
+repo = "unsloth/Qwen3.5-9B-GGUF"
+filename = "Qwen3.5-9B-Q4_K_M.gguf"
+quantization = "Q4_K_M"
+purpose = "Inference"
+
+[[models]]
+name = "mlx-community/Qwen3.5-9B-MLX-4bit"
+repo = "mlx-community/Qwen3.5-9B-MLX-4bit"
+filename = "Qwen3.5-9B-MLX-4bit"
+quantization = "4bit"
+purpose = "Inference"
+format = "Mlx"
+files = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "model.safetensors.index.json",
+]
