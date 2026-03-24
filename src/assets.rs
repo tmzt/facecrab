@@ -47,6 +47,13 @@ impl AssetAuthority {
         })
     }
 
+    /// Create an authority with only a cache directory (no config loading).
+    pub fn with_cache_dir(cache_dir: std::path::PathBuf) -> Result<Self> {
+        Ok(Self {
+            registry: ModelRegistry::with_cache_dir(cache_dir)?,
+        })
+    }
+
     /// Access the underlying model registry.
     pub fn registry(&self) -> &ModelRegistry {
         &self.registry
@@ -76,13 +83,15 @@ impl AssetAuthority {
 
     /// Download a model from a spec and return a stream of [AssetEvent]s.
     /// Use this for programmatic downloads where you already know the repo/files.
+    /// Uses the same cache directory as the parent authority.
     pub fn ensure_spec_stream(&self, spec: ModelSpec) -> mpsc::Receiver<AssetEvent> {
         let (tx, rx) = mpsc::channel(100);
+        let cache_dir = self.registry.get_cache_dir();
 
         async_std::task::spawn(async move {
             let mut err_tx = tx.clone();
             let result: Result<()> = async {
-                let auth = AssetAuthority::new()?;
+                let auth = AssetAuthority::with_cache_dir(cache_dir)?;
                 let name = spec.filename.clone();
                 match spec.format {
                     ModelFormat::Safetensors => {

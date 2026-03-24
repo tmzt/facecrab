@@ -45,6 +45,19 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// Create a minimal registry with only a cache directory (no config loading).
+    /// Use this when you already have a ModelSpec and just need download + caching.
+    pub fn with_cache_dir(cache_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&cache_dir)?;
+        let mut registry = Self {
+            config_dir: cache_dir.clone(),
+            cache_dir,
+            models: HashMap::new(),
+        };
+        registry.load_defaults()?;
+        Ok(registry)
+    }
+
     pub fn new() -> Result<Self> {
         let config_dir = if let Ok(home) = std::env::var("GENIUS_HOME") {
             PathBuf::from(home)
