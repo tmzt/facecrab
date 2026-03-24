@@ -379,7 +379,9 @@ async fn http_get(url: &str) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
         .map_err(|e| anyhow::anyhow!("connect {addr}: {e}"))?;
 
     if parsed.scheme() == "https" {
-        // TLS via rustls
+        // TLS via futures-rustls (re-exports rustls)
+        use futures_rustls::rustls;
+
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -389,7 +391,7 @@ async fn http_get(url: &str) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
-        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        let server_name = futures_rustls::pki_types::ServerName::try_from(host.to_string())
             .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
 
         let connector = futures_rustls::TlsConnector::from(Arc::new(config));
