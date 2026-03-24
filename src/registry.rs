@@ -26,10 +26,10 @@ pub struct ModelEntry {
     pub quantization: String,
     #[serde(default = "default_purpose")]
     pub purpose: ModelPurpose,
-    /// Model format: "Gguf" (default) or "Mlx".
+    /// Model format: "Gguf" (default) or "Safetensors".
     #[serde(default)]
     pub format: ModelFormat,
-    /// For multi-file formats (MLX), the list of files to download.
+    /// For multi-file formats (Safetensors), the list of files to download.
     #[serde(default)]
     pub files: Vec<String>,
 }

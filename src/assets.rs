@@ -74,6 +74,36 @@ impl AssetAuthority {
         handle.await
     }
 
+    /// Download a model from a spec and return a stream of [AssetEvent]s.
+    /// Use this for programmatic downloads where you already know the repo/files.
+    pub fn ensure_spec_stream(&self, spec: ModelSpec) -> mpsc::Receiver<AssetEvent> {
+        let (tx, rx) = mpsc::channel(100);
+
+        async_std::task::spawn(async move {
+            let mut err_tx = tx.clone();
+            let result: Result<()> = async {
+                let auth = AssetAuthority::new()?;
+                let name = spec.filename.clone();
+                match spec.format {
+                    ModelFormat::Safetensors => {
+                        auth.ensure_safetensors_model(&name, &spec, tx, false).await?;
+                    }
+                    ModelFormat::Gguf => {
+                        auth.ensure_gguf_model(&name, &spec, tx, false).await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                let _ = err_tx.send(AssetEvent::Error(e.to_string())).await;
+            }
+        });
+
+        rx
+    }
+
     /// Download a model and return a stream of [AssetEvent]s.
     pub fn ensure_model_stream(&self, name: &str) -> mpsc::Receiver<AssetEvent> {
         let (tx, rx) = mpsc::channel(100);
@@ -131,8 +161,8 @@ impl AssetAuthority {
         };
 
         match spec.format {
-            ModelFormat::Mlx => {
-                self.ensure_mlx_model(name, &spec, tx, silent).await
+            ModelFormat::Safetensors => {
+                self.ensure_safetensors_model(name, &spec, tx, silent).await
             }
             ModelFormat::Gguf => {
                 self.ensure_gguf_model(name, &spec, tx, silent).await
@@ -185,10 +215,10 @@ impl AssetAuthority {
         Ok(path)
     }
 
-    /// Download a multi-file MLX model directory.
-    /// Downloads listed files + discovers safetensors shards from the index.
+    /// Download a multi-file safetensors model directory.
+    /// Downloads listed files + discovers weight shards from the index.
     /// Returns the model directory path.
-    async fn ensure_mlx_model(
+    async fn ensure_safetensors_model(
         &self,
         name: &str,
         spec: &ModelSpec,
@@ -209,13 +239,13 @@ impl AssetAuthority {
         }
 
         if !silent {
-            println!("Downloading MLX model {} from {}...", spec.filename, spec.repo);
+            println!("Downloading {} from {}...", spec.filename, spec.repo);
         }
 
         // Start with the files listed in the registry entry
         let mut files_to_download: Vec<String> = spec.files.clone();
         if files_to_download.is_empty() {
-            // Minimum set for MLX models
+            // Minimum set for safetensors models
             files_to_download = vec![
                 "config.json".to_string(),
                 "tokenizer.json".to_string(),
@@ -233,7 +263,7 @@ impl AssetAuthority {
                 repo: spec.repo.clone(),
                 filename: file.clone(),
                 quantization: spec.quantization.clone(),
-                format: ModelFormat::Mlx,
+                format: ModelFormat::Safetensors,
                 files: vec![],
             };
             let _ = tx
@@ -271,7 +301,7 @@ impl AssetAuthority {
                 repo: spec.repo.clone(),
                 filename: shard.clone(),
                 quantization: spec.quantization.clone(),
-                format: ModelFormat::Mlx,
+                format: ModelFormat::Safetensors,
                 files: vec![],
             };
             self.download_file_with_events(&shard_spec, &shard_path, tx.clone())
@@ -287,7 +317,7 @@ impl AssetAuthority {
                 filename: spec.filename.clone(),
                 quantization: spec.quantization.clone(),
                 purpose: crate::registry::ModelPurpose::Inference,
-                format: ModelFormat::Mlx,
+                format: ModelFormat::Safetensors,
                 files: spec.files.clone(),
             })?;
         }

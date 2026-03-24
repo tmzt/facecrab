@@ -9,7 +9,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ModelFormat {
     Gguf,
-    Mlx,
+    Safetensors,
 }
 
 impl Default for ModelFormat {
