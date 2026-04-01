@@ -73,3 +73,17 @@ files = [
     "tokenizer_config.json",
     "model.safetensors.index.json",
 ]
+
+[[models]]
+name = "qwen-3.5-9b-neo"
+repo = "Jackrong/Qwen3.5-9B-Neo"
+filename = "Qwen3.5-9B-Neo"
+quantization = "BF16"
+purpose = "Inference"
+format = "Safetensors"
+files = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "model.safetensors.index.json",
+]
