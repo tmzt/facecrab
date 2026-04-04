@@ -378,8 +378,12 @@ impl AssetAuthority {
 
         let partial_path = final_path.with_extension("partial");
         let client = surf::Client::new().with(RedirectMiddleware::new(5));
-        let response = client
-            .get(&url)
+        let mut request = client.get(&url);
+        // Add HF auth token if available (for gated models like Gemma)
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        let response = request
             .await
             .map_err(|e| anyhow::anyhow!("Surf request failed: {}", e))?;
 
