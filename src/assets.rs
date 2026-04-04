@@ -238,9 +238,14 @@ impl AssetAuthority {
         let model_dir = cache_dir.join(&spec.filename);
         fs::create_dir_all(&model_dir)?;
 
-        // Check if already downloaded (config.json exists as sentinel)
+        // Check if already downloaded (need config.json AND at least one safetensors file)
         let config_path = model_dir.join("config.json");
-        if config_path.exists() {
+        let has_weights = model_dir.read_dir().ok()
+            .map(|entries| entries.flatten().any(|e| {
+                e.file_name().to_string_lossy().ends_with(".safetensors")
+            }))
+            .unwrap_or(false);
+        if config_path.exists() && has_weights {
             let _ = tx
                 .send(AssetEvent::Complete(model_dir.display().to_string()))
                 .await;
@@ -380,7 +385,10 @@ impl AssetAuthority {
         let client = surf::Client::new().with(RedirectMiddleware::new(5));
         let mut request = client.get(&url);
         // Add HF auth token if available (for gated models like Gemma)
-        if let Ok(token) = std::env::var("HF_TOKEN") {
+        // Check runtime env first, then baked-in token from build time
+        let hf_token = std::env::var("HF_TOKEN").ok()
+            .or_else(|| option_env!("HF_TOKEN_BAKED").map(|s| s.to_string()));
+        if let Some(token) = hf_token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
         let response = request
