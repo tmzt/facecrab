@@ -19,3 +19,5 @@ dirs = "5.0"
 surf = { version = "2.3", default-features = false, features = ["h1-client-rustls"] }
 async-std = { version = "1.12", features = ["attributes"] }
 futures = "0.3"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+log = "0.4"

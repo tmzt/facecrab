@@ -3,10 +3,232 @@ use crate::registry::ModelRegistry;
 use anyhow::Result;
 use futures::channel::mpsc;
 use futures::sink::SinkExt;
+use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use crate::core_types::{ModelFormat, ModelSpec, AssetEvent, GeniusError};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use xxhash_rust::xxh3::Xxh3;
+
+const FACECRAB_JSON: &str = "facecrab.json";
+const HASH_CHUNK: usize = 64 * 1024;
+
+/// Compute xxh3 hash of a file, returned as lowercase hex.
+fn hash_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Xxh3::new();
+    let mut buf = vec![0u8; HASH_CHUNK];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:016x}", hasher.digest()))
+}
+
+/// Write a `facecrab.json` manifest for the given files into `dir`.
+fn write_manifest(dir: &Path, files: &[impl AsRef<Path>]) -> Result<()> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for f in files {
+        let path = dir.join(f.as_ref());
+        if path.exists() {
+            let key = f.as_ref().to_string_lossy().to_string();
+            map.insert(key, hash_file(&path)?);
+        }
+    }
+    let manifest = serde_json::json!({ "version": 1, "files": map });
+    fs::write(dir.join(FACECRAB_JSON), serde_json::to_string_pretty(&manifest)?)?;
+    Ok(())
+}
+
+/// Verify that all files listed in `facecrab.json` exist and match their stored hashes.
+/// Returns Ok(true) if the manifest is present and all hashes match,
+/// Ok(false) if the manifest is missing or any hash mismatches,
+/// Err if the manifest is malformed.
+fn verify_manifest(dir: &Path) -> Result<bool> {
+    let manifest_path = dir.join(FACECRAB_JSON);
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(&manifest_path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&content)?;
+    let files = match parsed.get("files").and_then(|v| v.as_object()) {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    if files.is_empty() {
+        return Ok(false);
+    }
+    for (name, stored) in files {
+        let path = dir.join(name);
+        if !path.exists() {
+            log::debug!("facecrab: missing {name}");
+            return Ok(false);
+        }
+        let actual = hash_file(&path)?;
+        let expected = stored.as_str().unwrap_or("");
+        if actual != expected {
+            log::warn!("facecrab: hash mismatch for {name}: got {actual}, expected {expected}");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Verify a single-file manifest (GGUF sidecar): file hash must match the stored value.
+fn verify_manifest_single(file: &Path, manifest_path: &Path) -> Result<bool> {
+    let content = fs::read_to_string(manifest_path)?;
+    let parsed: serde_json::Value = serde_json::from_str(&content)?;
+    let files = match parsed.get("files").and_then(|v| v.as_object()) {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    let expected = match files.get(name.as_ref()).and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => return Ok(false),
+    };
+    let actual = hash_file(file)?;
+    if actual != expected {
+        log::warn!("facecrab: hash mismatch for {name}: got {actual}, expected {expected}");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+// ── Adaptive concurrency ──────────────────────────────────────────────────
+
+const MAX_SHARD_CONCURRENCY: usize = 4;
+
+/// Tracks per-shard throughput and adjusts the concurrency level heuristically.
+///
+/// Strategy:
+/// - Start at `max` concurrent downloads.
+/// - After each shard completes, record its bytes/sec.
+/// - If the latest throughput drops below 50% of the running peak and we
+///   haven't changed concurrency in the last 5 s, back off by 1.
+/// - If the latest throughput recovers above 85% of peak, try adding 1 back
+///   (up to `max`).
+struct AdaptiveConcurrency {
+    current: usize,
+    max: usize,
+    peak_bps: f64,
+    last_adjust: std::time::Instant,
+}
+
+impl AdaptiveConcurrency {
+    fn new(max: usize) -> Self {
+        Self {
+            current: max,
+            max,
+            peak_bps: 0.0,
+            last_adjust: std::time::Instant::now(),
+        }
+    }
+
+    /// Record a completed shard and return the (possibly updated) concurrency.
+    fn record(&mut self, bytes: u64, secs: f64) -> usize {
+        if secs < 0.1 {
+            return self.current; // too quick to measure meaningfully
+        }
+        let bps = bytes as f64 / secs;
+        if bps > self.peak_bps {
+            self.peak_bps = bps;
+        }
+
+        // Rate-limit adjustments to once every 5 s.
+        if self.last_adjust.elapsed().as_secs_f64() < 5.0 || self.peak_bps <= 0.0 {
+            return self.current;
+        }
+
+        let ratio = bps / self.peak_bps;
+        if ratio < 0.50 && self.current > 1 {
+            self.current -= 1;
+            self.last_adjust = std::time::Instant::now();
+            log::info!(
+                "facecrab: throughput fell to {:.0}% of peak ({:.1} MB/s → {:.1} MB/s), concurrency ↓{}",
+                ratio * 100.0, self.peak_bps / 1e6, bps / 1e6, self.current
+            );
+        } else if ratio > 0.85 && self.current < self.max {
+            self.current += 1;
+            self.last_adjust = std::time::Instant::now();
+            log::info!(
+                "facecrab: throughput healthy ({:.1} MB/s), concurrency ↑{}",
+                bps / 1e6, self.current
+            );
+        }
+
+        self.current
+    }
+}
+
+// ── Core download primitive ───────────────────────────────────────────────
+
+/// Download `url` to `final_path` (via a `.partial` staging file).
+/// Sends `AssetEvent::Progress` updates through `sender`.
+/// Returns the number of bytes written.
+async fn download_url_to_file(
+    url: &str,
+    final_path: &Path,
+    sender: mpsc::Sender<AssetEvent>,
+) -> Result<u64> {
+    let partial_path = final_path.with_extension("partial");
+    let client = surf::Client::new().with(RedirectMiddleware::new(5));
+    let mut request = client.get(url);
+
+    let hf_token = std::env::var("HF_TOKEN")
+        .ok()
+        .or_else(|| option_env!("HF_TOKEN_BAKED").map(|s| s.to_string()));
+    if let Some(token) = hf_token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+
+    let response = request
+        .await
+        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("HTTP {status} for {url}"));
+    }
+
+    let total_size = response
+        .header("Content-Length")
+        .and_then(|h| h.last().as_str().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let mut reader = ProgressReader {
+        inner: response,
+        current: 0,
+        total: total_size,
+        sender,
+    };
+
+    {
+        let std_file = std::fs::File::create(&partial_path)
+            .map_err(|e| anyhow::anyhow!("create partial: {e}"))?;
+        let mut file: async_std::fs::File = std_file.into();
+        if let Err(e) = futures::io::copy(&mut reader, &mut file).await {
+            let _ = std::fs::remove_file(&partial_path);
+            return Err(anyhow::anyhow!("stream failed: {e}"));
+        }
+    }
+
+    let bytes_written = reader.current;
+
+    if !partial_path.exists() {
+        return Err(anyhow::anyhow!("partial file missing before rename: {partial_path:?}"));
+    }
+    if let Err(e) = std::fs::rename(&partial_path, final_path) {
+        std::fs::copy(&partial_path, final_path)
+            .map_err(|e| anyhow::anyhow!("finalize failed: {e}"))?;
+        let _ = std::fs::remove_file(&partial_path);
+        let _ = e; // rename failed but copy succeeded
+    }
+
+    Ok(bytes_written)
+}
 
 pub struct AssetAuthority {
     registry: ModelRegistry,
@@ -191,11 +413,26 @@ impl AssetAuthority {
         fs::create_dir_all(&cache_dir)?;
 
         let path = cache_dir.join(&spec.filename);
+
+        // Verify via manifest if the file already exists.
         if path.exists() {
-            let _ = tx
-                .send(AssetEvent::Complete(path.display().to_string()))
-                .await;
-            return Ok(path);
+            let manifest_path = path.with_file_name(
+                format!("{}.facecrab.json", spec.filename)
+            );
+            let cached = if manifest_path.exists() {
+                match verify_manifest_single(&path, &manifest_path) {
+                    Ok(ok) => ok,
+                    Err(e) => { log::warn!("facecrab: manifest verify error for {name}: {e}"); false }
+                }
+            } else {
+                false
+            };
+            if cached {
+                let _ = tx
+                    .send(AssetEvent::Complete(path.display().to_string()))
+                    .await;
+                return Ok(path);
+            }
         }
 
         if !silent {
@@ -203,6 +440,19 @@ impl AssetAuthority {
         }
         self.download_file_with_events(spec, &path, tx.clone())
             .await?;
+
+        // Write a sidecar manifest for the GGUF file.
+        {
+            let manifest_path = path.with_file_name(
+                format!("{}.facecrab.json", spec.filename)
+            );
+            if let Ok(hash) = hash_file(&path) {
+                let manifest = serde_json::json!({ "version": 1, "files": { &spec.filename: hash } });
+                if let Err(e) = fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default()) {
+                    log::warn!("facecrab: failed to write manifest for {name}: {e}");
+                }
+            }
+        }
 
         // If it was a new model (resolved via heuristic), record it
         if self.registry.resolve(name).is_none() {
@@ -238,18 +488,16 @@ impl AssetAuthority {
         let model_dir = cache_dir.join(&spec.filename);
         fs::create_dir_all(&model_dir)?;
 
-        // Check if already downloaded (need config.json AND at least one safetensors file)
-        let config_path = model_dir.join("config.json");
-        let has_weights = model_dir.read_dir().ok()
-            .map(|entries| entries.flatten().any(|e| {
-                e.file_name().to_string_lossy().ends_with(".safetensors")
-            }))
-            .unwrap_or(false);
-        if config_path.exists() && has_weights {
-            let _ = tx
-                .send(AssetEvent::Complete(model_dir.display().to_string()))
-                .await;
-            return Ok(model_dir);
+        // Check if already fully downloaded by verifying facecrab.json hashes.
+        match verify_manifest(&model_dir) {
+            Ok(true) => {
+                let _ = tx
+                    .send(AssetEvent::Complete(model_dir.display().to_string()))
+                    .await;
+                return Ok(model_dir);
+            }
+            Ok(false) => {}
+            Err(e) => log::warn!("facecrab: manifest verify error for {name}: {e}"),
         }
 
         if !silent {
@@ -295,31 +543,61 @@ impl AssetAuthority {
             vec!["model.safetensors".to_string()]
         };
 
-        // Download weight shards
-        let total_shards = shard_files.len();
-        for (i, shard) in shard_files.iter().enumerate() {
-            let shard_path = model_dir.join(shard);
-            if shard_path.exists() {
-                continue;
+        // Download weight shards in parallel with adaptive concurrency.
+        {
+            let total_shards = shard_files.len();
+            let mut adapt = AdaptiveConcurrency::new(MAX_SHARD_CONCURRENCY);
+
+            // Only enqueue shards that aren't already on disk.
+            let mut queue: VecDeque<(usize, String)> = shard_files
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !model_dir.join(s).exists())
+                .map(|(i, s)| (i, s.clone()))
+                .collect();
+
+            if !queue.is_empty() {
+                type ShardFut = std::pin::Pin<Box<dyn futures::Future<Output = Result<(usize, u64, f64)>> + Send>>;
+                let mut in_flight: FuturesUnordered<ShardFut> = FuturesUnordered::new();
+
+                macro_rules! push_next {
+                    () => {
+                        if let Some((i, shard)) = queue.pop_front() {
+                            let shard_path = model_dir.join(&shard);
+                            let url = format!(
+                                "https://huggingface.co/{}/resolve/main/{}",
+                                spec.repo, shard
+                            );
+                            if !silent {
+                                println!("  [{}/{}] {}", i + 1, total_shards, shard);
+                            }
+                            let _ = tx.try_send(AssetEvent::Started(format!(
+                                "[{}/{}] {}", i + 1, total_shards, shard
+                            )));
+                            let tx2 = tx.clone();
+                            in_flight.push(Box::pin(async move {
+                                let t0 = std::time::Instant::now();
+                                let bytes = download_url_to_file(&url, &shard_path, tx2).await?;
+                                Ok((i, bytes, t0.elapsed().as_secs_f64()))
+                            }));
+                        }
+                    };
+                }
+
+                // Seed initial batch.
+                for _ in 0..adapt.current.min(queue.len()) {
+                    push_next!();
+                }
+
+                // Drain completions, refill up to current concurrency.
+                while let Some(result) = in_flight.next().await {
+                    let (_, bytes, secs) = result?;
+                    let concurrency = adapt.record(bytes, secs);
+                    while in_flight.len() < concurrency && !queue.is_empty() {
+                        push_next!();
+                    }
+                }
             }
-            if !silent {
-                println!("  [{}/{}] {}", i + 1, total_shards, shard);
-            }
-            let _ = tx.try_send(AssetEvent::Started(format!(
-                "[{}/{}] {}",
-                i + 1,
-                total_shards,
-                shard
-            )));
-            let shard_spec = ModelSpec {
-                repo: spec.repo.clone(),
-                filename: shard.clone(),
-                quantization: spec.quantization.clone(),
-                format: ModelFormat::Safetensors,
-                files: vec![],
-            };
-            self.download_file_with_events(&shard_spec, &shard_path, tx.clone())
-                .await?;
         }
 
         // Record in dynamic registry if not already known
@@ -334,6 +612,19 @@ impl AssetAuthority {
                 format: ModelFormat::Safetensors,
                 files: spec.files.clone(),
             })?;
+        }
+
+        // Write facecrab.json: hash all downloaded files (spec files + shards).
+        {
+            let mut all_files: Vec<String> = spec.files.clone();
+            for s in &shard_files {
+                if !all_files.contains(s) {
+                    all_files.push(s.clone());
+                }
+            }
+            if let Err(e) = write_manifest(&model_dir, &all_files) {
+                log::warn!("facecrab: failed to write manifest for {name}: {e}");
+            }
         }
 
         let _ = tx
@@ -374,72 +665,7 @@ impl AssetAuthority {
             "https://huggingface.co/{}/resolve/main/{}",
             spec.repo, spec.filename
         );
-        let _ = sender
-            .clone()
-            .try_send(AssetEvent::Started(format!("Downloading from: {}", url)));
-        if !final_path.exists() {
-            println!("DEBUG: Downloading from URL: {}", url);
-        }
-
-        let partial_path = final_path.with_extension("partial");
-        let client = surf::Client::new().with(RedirectMiddleware::new(5));
-        let mut request = client.get(&url);
-        // Add HF auth token if available (for gated models like Gemma)
-        // Check runtime env first, then baked-in token from build time
-        let hf_token = std::env::var("HF_TOKEN").ok()
-            .or_else(|| option_env!("HF_TOKEN_BAKED").map(|s| s.to_string()));
-        if let Some(token) = hf_token {
-            request = request.header("Authorization", format!("Bearer {token}"));
-        }
-        let response = request
-            .await
-            .map_err(|e| anyhow::anyhow!("Surf request failed: {}", e))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("Download failed with status: {}", status));
-        }
-
-        let total_size = response
-            .header("Content-Length")
-            .and_then(|h| h.last().as_str().parse::<u64>().ok())
-            .unwrap_or(0);
-
-        let mut reader = ProgressReader {
-            inner: response,
-            current: 0,
-            total: total_size,
-            sender,
-        };
-
-        {
-            let std_file = std::fs::File::create(&partial_path)
-                .map_err(|e| anyhow::anyhow!("Failed to create partial file: {}", e))?;
-            let mut file: async_std::fs::File = std_file.into();
-
-            if let Err(e) = futures::io::copy(&mut reader, &mut file).await {
-                let _ = std::fs::remove_file(&partial_path);
-                return Err(anyhow::anyhow!("Streaming failed: {}", e));
-            }
-        }
-
-        if !partial_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Partial file missing before rename: {:?}",
-                partial_path
-            ));
-        }
-
-        if let Err(e) = std::fs::rename(&partial_path, final_path) {
-            eprintln!(
-                "Warning: rename {:?} -> {:?} failed ({}), falling back to copy...",
-                partial_path, final_path, e
-            );
-            std::fs::copy(&partial_path, final_path).map_err(|e| {
-                anyhow::anyhow!("Failed to finalize model file (copy fallback): {}", e)
-            })?;
-            let _ = std::fs::remove_file(&partial_path);
-        }
+        download_url_to_file(&url, final_path, sender).await?;
         Ok(())
     }
 }
