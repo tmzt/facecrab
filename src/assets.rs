@@ -185,15 +185,30 @@ async fn download_url_to_file(
         request = request.header("Authorization", format!("Bearer {token}"));
     }
 
-    let response = request
-        .await
-        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    log::debug!("facecrab: GET {url}");
+    let response = request.await.map_err(|e| {
+        // Classify connection errors so DNS failures are obvious in logcat.
+        let msg = e.to_string();
+        if msg.contains("address information")
+            || msg.contains("Name or service")
+            || msg.contains("No such host")
+            || msg.contains("lookup")
+        {
+            log::error!("facecrab: DNS lookup failed for {url}: {e}");
+            anyhow::anyhow!("DNS lookup failed for {url}: {e}")
+        } else {
+            log::error!("facecrab: connection error for {url}: {e}");
+            anyhow::anyhow!("connection error for {url}: {e}")
+        }
+    })?;
+
     let status = response.status();
     if !status.is_success() {
+        log::error!("facecrab: HTTP {status} for {url}");
         return Err(anyhow::anyhow!("HTTP {status} for {url}"));
     }
 
-    let total_size = response
+    let content_length = response
         .header("Content-Length")
         .and_then(|h| h.last().as_str().parse::<u64>().ok())
         .unwrap_or(0);
@@ -201,7 +216,7 @@ async fn download_url_to_file(
     let mut reader = ProgressReader {
         inner: response,
         current: 0,
-        total: total_size,
+        total: content_length,
         sender,
     };
 
@@ -211,11 +226,25 @@ async fn download_url_to_file(
         let mut file: async_std::fs::File = std_file.into();
         if let Err(e) = futures::io::copy(&mut reader, &mut file).await {
             let _ = std::fs::remove_file(&partial_path);
+            log::error!("facecrab: stream error for {url}: {e}");
             return Err(anyhow::anyhow!("stream failed: {e}"));
         }
     }
 
     let bytes_written = reader.current;
+
+    // Detect silent truncation: server closed the connection before sending
+    // all bytes promised by Content-Length. futures::io::copy treats early EOF
+    // as success, so we must check manually.
+    if content_length > 0 && bytes_written < content_length {
+        let _ = std::fs::remove_file(&partial_path);
+        log::error!(
+            "facecrab: truncated download for {url}: got {bytes_written}/{content_length} bytes"
+        );
+        return Err(anyhow::anyhow!(
+            "truncated: {bytes_written}/{content_length} bytes for {url}"
+        ));
+    }
 
     if !partial_path.exists() {
         return Err(anyhow::anyhow!("partial file missing before rename: {partial_path:?}"));
@@ -224,9 +253,10 @@ async fn download_url_to_file(
         std::fs::copy(&partial_path, final_path)
             .map_err(|e| anyhow::anyhow!("finalize failed: {e}"))?;
         let _ = std::fs::remove_file(&partial_path);
-        let _ = e; // rename failed but copy succeeded
+        let _ = e;
     }
 
+    log::debug!("facecrab: wrote {bytes_written} bytes → {final_path:?}");
     Ok(bytes_written)
 }
 
