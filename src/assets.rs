@@ -29,16 +29,19 @@ fn hash_file(path: &Path) -> Result<String> {
 }
 
 /// Write a `facecrab.json` manifest for the given files into `dir`.
+/// Values are `"hash:size"` — verification checks size first, skips hash if size matches.
 fn write_manifest(dir: &Path, files: &[impl AsRef<Path>]) -> Result<()> {
     let mut map: HashMap<String, String> = HashMap::new();
     for f in files {
         let path = dir.join(f.as_ref());
         if path.exists() {
             let key = f.as_ref().to_string_lossy().to_string();
-            map.insert(key, hash_file(&path)?);
+            let size = fs::metadata(&path)?.len();
+            let hash = hash_file(&path)?;
+            map.insert(key, format!("{hash}:{size}"));
         }
     }
-    let manifest = serde_json::json!({ "version": 1, "files": map });
+    let manifest = serde_json::json!({ "version": 2, "files": map });
     fs::write(dir.join(FACECRAB_JSON), serde_json::to_string_pretty(&manifest)?)?;
     Ok(())
 }
@@ -67,11 +70,30 @@ fn verify_manifest(dir: &Path) -> Result<bool> {
             log::debug!("facecrab: missing {name}");
             return Ok(false);
         }
-        let actual = hash_file(&path)?;
-        let expected = stored.as_str().unwrap_or("");
-        if actual != expected {
-            log::warn!("facecrab: hash mismatch for {name}: got {actual}, expected {expected}");
-            return Ok(false);
+        let val = stored.as_str().unwrap_or("");
+        if let Some((hash, size_str)) = val.split_once(':') {
+            // v2: "hash:size" — size match is sufficient
+            if let Ok(expected_size) = size_str.parse::<u64>() {
+                let actual_size = fs::metadata(&path)?.len();
+                if actual_size != expected_size {
+                    log::warn!("facecrab: size mismatch for {name}: got {actual_size}, expected {expected_size}");
+                    return Ok(false);
+                }
+            } else {
+                // Malformed size, fall back to hash check
+                let actual = hash_file(&path)?;
+                if actual != hash {
+                    log::warn!("facecrab: hash mismatch for {name}");
+                    return Ok(false);
+                }
+            }
+        } else {
+            // v1: hash only
+            let actual = hash_file(&path)?;
+            if actual != val {
+                log::warn!("facecrab: hash mismatch for {name}: got {actual}, expected {val}");
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -86,14 +108,24 @@ fn verify_manifest_single(file: &Path, manifest_path: &Path) -> Result<bool> {
         None => return Ok(false),
     };
     let name = file.file_name().unwrap_or_default().to_string_lossy();
-    let expected = match files.get(name.as_ref()).and_then(|v| v.as_str()) {
+    let val = match files.get(name.as_ref()).and_then(|v| v.as_str()) {
         Some(h) => h,
         None => return Ok(false),
     };
-    let actual = hash_file(file)?;
-    if actual != expected {
-        log::warn!("facecrab: hash mismatch for {name}: got {actual}, expected {expected}");
-        return Ok(false);
+    if let Some((_hash, size_str)) = val.split_once(':') {
+        if let Ok(expected_size) = size_str.parse::<u64>() {
+            let actual_size = fs::metadata(file)?.len();
+            if actual_size != expected_size {
+                log::warn!("facecrab: size mismatch for {name}: got {actual_size}, expected {expected_size}");
+                return Ok(false);
+            }
+        }
+    } else {
+        let actual = hash_file(file)?;
+        if actual != val {
+            log::warn!("facecrab: hash mismatch for {name}: got {actual}, expected {val}");
+            return Ok(false);
+        }
     }
     Ok(true)
 }
